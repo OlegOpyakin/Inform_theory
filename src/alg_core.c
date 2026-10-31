@@ -6,6 +6,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <stdint.h>
 #include "alg_core.h"
 
 #include <errno.h>
@@ -27,9 +28,25 @@
 #ifndef SPLICE_F_GIFT
 #define SPLICE_F_GIFT 8
 #endif
+#ifndef SPLICE_F_MORE
+#define SPLICE_F_MORE 4
+#endif
 
+/* Send/receive buffer asked for on each op socket (covers 16 MiB payloads). */
+#define ALG_SOCKBUF_WANT (32 * 1024 * 1024)
+
+/* Print "alg_core: what: strerror(errno)", leaving errno intact for callers. */
 static void perr(const char *what) {
-    fprintf(stderr, "alg_core: %s: %s\n", what, strerror(errno));
+    int e = errno;
+    fprintf(stderr, "alg_core: %s: %s\n", what, strerror(e));
+    if (e == ENOMEM) {
+        static int hinted;
+        if (!hinted++)
+            fprintf(stderr, "alg_core: hint: AF_ALG scatterlists are charged to "
+                    "net.core.optmem_max (per network namespace); large payloads "
+                    "need e.g. sysctl -w net.core.optmem_max=1048576\n");
+    }
+    errno = e;
 }
 
 /*
@@ -84,6 +101,45 @@ static size_t control_bufsz(const struct alg_ctx *c) {
     return sz;
 }
 
+/*
+ * Ask for a socket buffer of ALG_SOCKBUF_WANT; the kernel silently caps it at
+ * net.core.{w,r}mem_max, so check what we got and warn once per buffer kind.
+ */
+static int size_sockbuf(int fd, int opt, const char *name, const char *sysctl,
+                        const char *symptom, int *warned) {
+    int want = ALG_SOCKBUF_WANT, got = 0;
+    socklen_t gl = sizeof(got);
+    if (setsockopt(fd, SOL_SOCKET, opt, &want, sizeof(want)) < 0)
+        perr(name);
+    if (getsockopt(fd, SOL_SOCKET, opt, &got, &gl) < 0) return 0;
+    if (got < want && !(*warned)++)
+        fprintf(stderr, "alg_core: warning: %s capped at %d bytes (wanted %d); "
+                "payloads above ~%d KiB %s. Raise it: sysctl -w %s=67108864\n",
+                name, got, want, got / 2048, symptom, sysctl);
+    return got;
+}
+
+/*
+ * accept() the operation socket and size its buffers:
+ *  - SO_SNDBUF: a sendmsg/splice larger than it deadlocks in
+ *    af_alg_wait_for_wmem, because the reader runs only after sendmsg returns.
+ *  - SO_RCVBUF: the kernel builds at most this much output per internal
+ *    pass of recvmsg. skcipher copes (IV chained across passes), but AEAD
+ *    silently becomes several separate operations inside ONE read() — full
+ *    length, wrong ciphertext — so op_sendmsg refuses AEAD messages that do
+ *    not fit (see c->rcvbuf).
+ */
+static int open_opfd(struct alg_ctx *c) {
+    static int warned_snd, warned_rcv;
+    c->opfd = accept(c->tfmfd, NULL, 0);
+    if (c->opfd < 0) { perr("accept"); return -1; }
+    size_sockbuf(c->opfd, SO_SNDBUF, "SO_SNDBUF", "net.core.wmem_max",
+                 "may hang", &warned_snd);
+    c->rcvbuf = size_sockbuf(c->opfd, SO_RCVBUF, "SO_RCVBUF", "net.core.rmem_max",
+                             "fail for AEAD", &warned_rcv);
+    return 0;
+}
+
 int alg_setup(struct alg_ctx *c,
               const char *type, const char *name,
               const unsigned char *key, size_t keylen,
@@ -123,8 +179,7 @@ int alg_setup(struct alg_ctx *c,
         }
     }
 
-    c->opfd = accept(c->tfmfd, NULL, 0);
-    if (c->opfd < 0) { perr("accept"); goto fail; }
+    if (open_opfd(c) < 0) goto fail;
 
     if (method == ALG_METHOD_SPLICE) {
         if (pipe(c->pipefd) < 0) { perr("pipe"); goto fail; }
@@ -146,11 +201,15 @@ int alg_set_iv(struct alg_ctx *c, const unsigned char *iv, size_t len) {
 int alg_set_aead(struct alg_ctx *c, size_t assoclen, size_t taglen) {
     c->assoclen = assoclen;
     c->taglen = taglen;
+    /* The kernel only accepts AUTHSIZE while the transform has no operation
+     * socket (EBUSY otherwise), so drop the one alg_setup() opened, set the
+     * tag size, and accept a fresh one. */
+    if (c->opfd >= 0) { close(c->opfd); c->opfd = -1; }
     if (setsockopt(c->tfmfd, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, NULL, taglen) < 0) {
         perr("setsockopt(ALG_SET_AEAD_AUTHSIZE)");
         return -1;
     }
-    return 0;
+    return open_opfd(c);
 }
 
 /* Read exactly `len` bytes from opfd into out, looping over short reads. */
@@ -179,6 +238,18 @@ ssize_t op_sendmsg(struct alg_ctx *c, alg_dir_t dir,
         build_control(c, dir, &msg, cbuf, control_bufsz(c));
     }
 
+    /* An AEAD message larger than the receive buffer is silently processed by
+     * the kernel as several independent operations within one read() (full
+     * length returned, wrong ciphertext/tag). Undetectable afterwards, so
+     * refuse up front; one page of slack for the kernel's accounting. */
+    if (c->kind == ALG_KIND_AEAD && c->rcvbuf > 0 &&
+        len + c->taglen + (size_t)c->page_size > (size_t)c->rcvbuf) {
+        fprintf(stderr, "alg_core: AEAD message of %zu bytes exceeds SO_RCVBUF (%d); "
+                "raise net.core.rmem_max\n", len, c->rcvbuf);
+        errno = EMSGSIZE;
+        return -1;
+    }
+
     struct iovec iov;
     iov.iov_base = (void *)in;
     iov.iov_len = len;
@@ -202,42 +273,131 @@ ssize_t op_sendmsg(struct alg_ctx *c, alg_dir_t dir,
     return got;
 }
 
-ssize_t op_splice(struct alg_ctx *c, alg_dir_t dir,
-                  void *in, void *out, size_t len) {
+/* Cipher block size for chunking: non-final chunks must be whole blocks. */
+#define ALG_CHUNK_ALIGN 16
+
+/*
+ * Where the splice path takes its payload from: a user buffer (vmsplice'd
+ * into the pipe) or a file (spliced from its page cache into the pipe).
+ */
+struct splice_src {
+    char    *buf;       /* user buffer, or NULL for a file source  */
+    int      fd;        /* file source                             */
+    off64_t *off;       /* in/out file offset                      */
+};
+
+/*
+ * Bytes for the next chunk starting at `pos`. The pipe holds 16 page buffers
+ * (splice_max), and a buffer that does not start on a page boundary spans one
+ * extra page — so cap the chunk at the pages left from its starting offset,
+ * otherwise vmsplice comes back short and the op fails (unaligned >= 64 KiB).
+ * Non-final skcipher chunks are rounded down to whole blocks so the kernel can
+ * process them while MSG_MORE is still set.
+ */
+static size_t next_chunk(const struct alg_ctx *c, const struct splice_src *s,
+                         size_t pos, size_t len) {
+    size_t pgoff = s->buf ? (size_t)((uintptr_t)(s->buf + pos) % (uintptr_t)c->page_size)
+                          : (size_t)(*s->off % c->page_size);
+    size_t chunk = c->splice_max - pgoff;
+    if (chunk >= len - pos) return len - pos;
+    if (c->kind != ALG_KIND_HASH) chunk -= chunk % ALG_CHUNK_ALIGN;
+    return chunk;
+}
+
+/* Put exactly `chunk` bytes of the source into the pipe. */
+static int fill_pipe(struct alg_ctx *c, const struct splice_src *s,
+                     size_t pos, size_t chunk) {
+    size_t done = 0;
+    while (done < chunk) {
+        ssize_t sp;
+        if (s->buf) {
+            struct iovec iov = { .iov_base = s->buf + pos + done,
+                                 .iov_len  = chunk - done };
+            sp = vmsplice(c->pipefd[1], &iov, 1, SPLICE_F_GIFT);
+            if (sp < 0) { perr("vmsplice"); return -1; }
+        } else {
+            sp = splice(s->fd, s->off, c->pipefd[1], NULL, chunk - done, 0);
+            if (sp < 0) { perr("splice(file->pipe)"); return -1; }
+        }
+        if (sp == 0) { errno = EIO; perr("splice: short source"); return -1; }
+        done += (size_t)sp;
+    }
+    return 0;
+}
+
+/*
+ * One logical operation streamed over the splice path: a single control
+ * message (op + IV) with MSG_MORE, then each chunk spliced pipe -> opfd with
+ * SPLICE_F_MORE on all but the last. The kernel keeps the IV chained across
+ * chunks (ctx->iv), so the output is one valid ciphertext / one digest of the
+ * whole input, while every chunk still goes through the zero-copy splice.
+ */
+static ssize_t splice_stream(struct alg_ctx *c, alg_dir_t dir,
+                             const struct splice_src *s, void *out, size_t len) {
     if (c->kind == ALG_KIND_AEAD) { errno = ENOTSUP; return -1; }
     if (c->pipefd[1] < 0) { errno = EINVAL; return -1; }
 
-    size_t off = 0;
-    while (off < len) {
-        size_t chunk = len - off;
-        if (chunk > c->splice_max) chunk = c->splice_max;
+    if (c->kind != ALG_KIND_HASH) {
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        char cbuf[256];
+        build_control(c, dir, &msg, cbuf, control_bufsz(c));
+        if (sendmsg(c->opfd, &msg, MSG_MORE) < 0) { perr("sendmsg(MSG_MORE)"); return -1; }
+    }
 
-        /* Control first, with MSG_MORE so the kernel waits for the spliced data. */
-        if (c->kind != ALG_KIND_HASH) {
-            struct msghdr msg;
-            memset(&msg, 0, sizeof(msg));
-            char cbuf[256];
-            build_control(c, dir, &msg, cbuf, control_bufsz(c));
-            if (sendmsg(c->opfd, &msg, MSG_MORE) < 0) { perr("sendmsg(MSG_MORE)"); return -1; }
+    size_t pos = 0;
+    while (pos < len) {
+        size_t chunk = next_chunk(c, s, pos, len);
+        int last = (pos + chunk == len);
+
+        if (fill_pipe(c, s, pos, chunk) < 0) return -1;
+
+        /* pipe -> opfd: zero-copy on pre-fix kernels, copied on post-fix. */
+        size_t moved = 0;
+        while (moved < chunk) {
+            unsigned int fl = last ? 0 : SPLICE_F_MORE;
+            ssize_t mv = splice(c->pipefd[0], NULL, c->opfd, NULL, chunk - moved, fl);
+            if (mv < 0) { perr("splice(pipe->opfd)"); return -1; }
+            if (mv == 0) { errno = EIO; perr("splice(pipe->opfd): no progress"); return -1; }
+            moved += (size_t)mv;
         }
 
-        struct iovec iov;
-        iov.iov_base = (char *)in + off;
-        iov.iov_len = chunk;
-        ssize_t sp = vmsplice(c->pipefd[1], &iov, 1, SPLICE_F_GIFT);
-        if (sp < 0) { perr("vmsplice"); return -1; }
-
-        ssize_t mv = splice(c->pipefd[0], NULL, c->opfd, NULL, (size_t)sp, 0);
-        if (mv < 0) { perr("splice"); return -1; }
-
-        size_t want = (c->kind == ALG_KIND_HASH) ? c->digestlen : (size_t)mv;
-        ssize_t got = read_full(c->opfd, (char *)out + off, want);
-        if (got < 0) { perr("read"); return -1; }
-
-        off += chunk;
-        if (c->kind == ALG_KIND_HASH) break; /* single digest, whole input */
+        if (c->kind != ALG_KIND_HASH) {
+            ssize_t got = read_full(c->opfd, (char *)out + pos, chunk);
+            if (got < 0) { perr("read"); return -1; }
+            if ((size_t)got != chunk) { errno = EIO; perr("read: short ciphertext"); return -1; }
+        }
+        pos += chunk;
     }
-    return (ssize_t)(c->kind == ALG_KIND_HASH ? c->digestlen : len);
+
+    if (c->kind == ALG_KIND_HASH) {
+        ssize_t got = read_full(c->opfd, out, c->digestlen);
+        if (got < 0) { perr("read"); return -1; }
+        return got;
+    }
+    return (ssize_t)len;
+}
+
+ssize_t op_splice(struct alg_ctx *c, alg_dir_t dir,
+                  void *in, void *out, size_t len) {
+    struct splice_src s = { .buf = in, .fd = -1, .off = NULL };
+    return splice_stream(c, dir, &s, out, len);
+}
+
+/*
+ * op_splice_file — true zero-copy: splice directly from a file's page cache
+ * into the AF_ALG op socket. This is the path targeted by the zero-copy
+ * removal (ffdd2bc3, May 2026): on pre-fix kernels pages are pinned into the
+ * crypto scatterlist without memcpy; on post-fix they are copied internally.
+ *
+ * `file_off` is in/out: starting offset on entry, advanced by bytes consumed.
+ * Reset to 0 before each iteration to re-encrypt the same file content.
+ */
+ssize_t op_splice_file(struct alg_ctx *c, alg_dir_t dir,
+                       int file_fd, off64_t *file_off,
+                       void *out, size_t len) {
+    struct splice_src s = { .buf = NULL, .fd = file_fd, .off = file_off };
+    return splice_stream(c, dir, &s, out, len);
 }
 
 void alg_teardown(struct alg_ctx *c) {

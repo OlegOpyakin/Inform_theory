@@ -19,7 +19,10 @@ README is the operational guide.
 | 0 | `src/alg_core.{c,h}` | AF_ALG crypto core: `alg_setup`, `build_control`, `op_sendmsg`, `op_splice`. Shared by layers 0 and 2. |
 | 0 | `src/afalg_bench.c` | Standalone harness: copy vs zero-copy, size/alignment/thread sweeps, throughput + latency. |
 | 1 | `src/openssl_bench.c` | Reference baseline: OpenSSL EVP (AES-NI / ARMv8 crypto). The "always slower" comparator. |
-| 2 | `src/afalg_fio_engine.c` | fio external ioengine (skeleton) wrapping the crypto core for numjobs/iodepth/AIO + latency percentiles. |
+| 2 | `src/afalg_fio_engine.c` | fio external ioengine, **sync** (`bin/afalg.so`): one op per `queue()`, so iodepth is effectively 1. |
+| 2 | `src/afalg_fio_async.c` | fio external ioengine, **async** (`bin/afalg_async.so`): per-job pool of `iodepth` workers, one AF_ALG socket each — real qd>1. |
+| 2 | `src/afalg_fio_common.{c,h}` | Options + AF_ALG context setup shared by both fio engines. |
+| — | `src/ref_crypto.{c,h}` | One-shot OpenSSL reference used by `--verify` in both benches. |
 | 3 | `scripts/run_matrix.sh` | Orchestration: sweeps the matrix, wraps runs with `perf stat`, writes `results/results_$(uname -r).csv`. |
 | — | `src/bench_common.{c,h}` | Timing, latency percentiles, buffers, CSV schema (shared by both benches). |
 | — | `scripts/plot_results.py` | Aggregates repeats → mean + 95% CI, writes a summary CSV and charts. |
@@ -33,7 +36,7 @@ are compared cell-for-cell via the `kernel` column.
 
 ```sh
 make all            # afalg_bench (Linux) + openssl_bench (portable)
-make afalg_bench    # Layer 0, Linux only (needs <linux/if_alg.h>)
+make afalg_bench    # Layer 0, Linux only (needs <linux/if_alg.h>; links OpenSSL for --verify)
 make openssl_bench  # Layer 1, needs OpenSSL dev headers
 ```
 
@@ -47,8 +50,12 @@ The engine uses fio's private headers, which change between releases, so build
 it against the fio source tree you will run:
 
 ```sh
-make fio-engine FIO_SRC=/path/to/fio      # -> bin/afalg.so
+make fio-engine FIO_SRC=/path/to/fio      # -> bin/afalg.so (sync) + bin/afalg_async.so (async)
 ```
+
+The two engines are deliberately separate: choose by the `.so` you load. Use
+`afalg.so` for `--iodepth=1`; for `--iodepth>1` use `afalg_async.so` — the sync
+engine is `FIO_SYNCIO`, so with it "qd8" measures exactly the same as "qd1".
 
 Then drive it with fio:
 
@@ -78,6 +85,20 @@ Add `--csv` for a machine-readable row, `--header` to print the column header.
 See `--help` on either bench for the full option list (`--type`, `--op`,
 `--aligned/--unaligned`, `--threads`, `--keybits`, AEAD `--taglen/--assoclen`).
 
+`--verify` (both benches) runs the timed path once before the loop and checks
+its output byte-for-byte against a one-shot OpenSSL EVP result; a mismatch
+exits non-zero. `run_matrix.sh` passes it with `VERIFY=1`; `run_bench.sh`
+always runs a verify sweep first (STEP 1a). `afalg_bench --file-backed` splices
+from a temp file's page cache (variant `afalg-zc-file`).
+
+Throughput in both benches is total timed bytes over the wall time of the
+timed phase: all threads are released together by a start barrier after their
+warmup, and the clock stops when the last one finishes. Warmup is excluded and
+`threads>1` is a real aggregate measurement. Both benches share the formula
+(`throughput_mbps`), so AF_ALG and userspace rows are comparable. Rows carry a
+`keybits` column (0 for unkeyed hashes); `openssl_bench` rejects algorithms
+and key sizes it cannot run instead of silently falling back to AES-128-CBC.
+
 ### The whole matrix
 
 ```sh
@@ -89,7 +110,18 @@ VARIANTS="userspace-aesni afalg-copy" SIZES="4096 65536 1048576" \
   REPEATS=3 NO_PERF=1 scripts/run_matrix.sh
 ```
 
-Output: `results/results_$(uname -r).csv`, one row per run. Run the **same
+Payloads up to 16 MiB need raised socket limits — `run_bench.sh` sets them,
+and `alg_core` warns when they are too low:
+
+```sh
+sudo sysctl -w net.core.wmem_max=67108864    # else sendmsg > ~208 KiB hangs
+sudo sysctl -w net.core.rmem_max=67108864    # else AEAD > ~200 KiB is refused
+sudo sysctl -w net.core.optmem_max=1048576   # else ~16 MiB sendmsg fails (ENOMEM)
+```
+
+Output: `results/results_$(uname -r).csv`, one row per run. The script refuses
+to append to a file whose header differs (e.g. other `PERF_EVENTS`); move the
+old file aside. `VARIANTS` also accepts `afalg-zc-file` (`--file-backed`). Run the **same
 script on both kernels** (old zero-copy build, new fixed build) to populate the
 two-kernel comparison. Env knobs are documented in the script header
 (`VARIANTS ALGS SIZES ALIGNS THREADS OPS KEYBITS REPEATS ITERS WARMUP PIN_CPU
@@ -101,7 +133,7 @@ GOVERNOR NO_PERF`).
 python3 scripts/plot_results.py results/results_*.csv -o figures --summary results/summary.csv
 ```
 
-Produces `results/summary.csv` (per-cell mean + 95% CI) and PNGs per
+Produces `results/summary.csv` (per-cell mean + 95% CI, Student t) and PNGs per
 alg × alignment × threads × metric, with a series per `(variant, kernel)` — so
 the fix's cost (`afalg-zc` old vs new kernel) and the AF_ALG↔userspace gap read
 straight off the chart. Needs `matplotlib` for the PNGs; the summary CSV is
@@ -130,7 +162,9 @@ Set by `run_matrix.sh` when asked (needs root); see plan §Методологи�
 
 **Coverage / caveats** (plan §Ограничения): skcipher and hash are fully
 exercised; AEAD (`gcm(aes)`) is implemented but experimental on the AF_ALG side
-(the copy path only; `op_splice` returns `ENOTSUP` for AEAD). Payloads above the
-zero-copy ceiling (16 pages ≈ 64 KB) are chunked — valid for throughput timing,
-not a single valid ciphertext under CBC chaining. Ciphertext correctness is a
-separate concern from timing and is not validated in the hot loop.
+(the copy path only; `op_splice` returns `ENOTSUP` for AEAD; `--verify` checks
+AEAD encrypt without AAD only). On the splice paths, payloads above the
+zero-copy ceiling (16 pages ≈ 64 KB, one page less for unaligned buffers) are
+streamed as ONE operation — one control message, chunks spliced with
+`SPLICE_F_MORE`, IV chained by the kernel — so the output is a single valid
+ciphertext / digest at any size (checked by `--verify`, outside the hot loop).

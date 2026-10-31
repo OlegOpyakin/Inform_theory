@@ -37,6 +37,27 @@ void   lat_summary(struct lat_stats *s,
 void *alloc_payload(size_t len, int aligned, size_t misalign, void **raw_out);
 
 /*
+ * Aggregate throughput in MB/s (MiB): all timed bytes (size * iters * threads)
+ * over `timed_ns`, the wall time of the timed phase only — from the moment all
+ * workers leave the start barrier (after warmup) until the last one finishes.
+ * Warmup is excluded and threads > 1 is a real measurement (contention shows
+ * up), not busy/threads. Both benches use this so rows are comparable.
+ */
+double throughput_mbps(size_t size, long iters, int threads, uint64_t timed_ns);
+
+/*
+ * Start barrier for the timed phase (portable: macOS has no pthread_barrier).
+ * Each worker calls bench_barrier_wait() after its warmup; it returns when all
+ * `n` have arrived. A worker that fails before arriving must still call
+ * bench_barrier_abandon() so the others are not left waiting.
+ */
+struct bench_barrier;
+struct bench_barrier *bench_barrier_new(int n);
+void bench_barrier_wait(struct bench_barrier *b);
+void bench_barrier_abandon(struct bench_barrier *b);
+void bench_barrier_free(struct bench_barrier *b);
+
+/*
  * Fixed CSV schema emitted by every bench with --csv (no header; the header is
  * written by scripts/run_matrix.sh). One row per run.
  */
@@ -54,6 +75,7 @@ struct run_row {
     double      throughput_MBps;
     double      lat_min_us, lat_p50_us, lat_p99_us, lat_max_us;
     const char *kernel;       /* uname -r                                      */
+    int         keybits;      /* cipher key size; 0 for unkeyed hashes         */
 };
 
 /* The header matching run_row, used by run_matrix.sh when creating a CSV. */

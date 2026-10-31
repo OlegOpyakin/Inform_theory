@@ -42,8 +42,22 @@ def to_float(v):
         return None
 
 
+# Two-sided 95% Student t quantiles by degrees of freedom. With the 3-10
+# repeats per cell used here, the normal 1.96 understates the CI by 15-130%.
+T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
+       8: 2.306, 9: 2.262, 10: 2.228, 12: 2.179, 15: 2.131, 20: 2.086,
+       30: 2.042, 60: 2.000}
+
+
+def t95(df):
+    """t quantile for df, conservatively rounding df down to the table."""
+    if df >= 120:
+        return 1.96
+    return T95[max(k for k in T95 if k <= df)]
+
+
 def mean_ci(vals):
-    """Return (mean, half-width of 95% CI). Uses normal approx (1.96)."""
+    """Return (mean, half-width of 95% CI) using the Student t distribution."""
     vals = [v for v in vals if v is not None]
     n = len(vals)
     if n == 0:
@@ -53,11 +67,13 @@ def mean_ci(vals):
         return m, 0.0
     var = sum((v - m) ** 2 for v in vals) / (n - 1)
     sd = math.sqrt(var)
-    return m, 1.96 * sd / math.sqrt(n)
+    return m, t95(n - 1) * sd / math.sqrt(n)
 
 
-# A "cell" is one matrix point; repeats collapse into it.
-CELL_KEYS = ("variant", "kernel", "alg", "type", "op", "alignment", "threads", "bytes")
+# A "cell" is one matrix point; repeats collapse into it. keybits is "" in CSVs
+# written before that column existed.
+CELL_KEYS = ("variant", "kernel", "alg", "keybits", "type", "op", "alignment",
+             "threads", "bytes")
 METRICS = ("throughput_MBps", "lat_p50_us", "lat_p99_us", "cycles_per_byte")
 
 
@@ -86,7 +102,7 @@ def write_summary(agg, path):
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
-        for d in sorted(agg.values(), key=lambda x: (x["alg"], x["alignment"],
+        for d in sorted(agg.values(), key=lambda x: (x["alg"], x["keybits"], x["alignment"],
                                                       x["threads"], x["variant"],
                                                       x["kernel"],
                                                       to_float(x["bytes"]) or 0)):
@@ -124,13 +140,14 @@ def plot(agg, outdir):
     os.makedirs(outdir, exist_ok=True)
     cells = list(agg.values())
 
-    # Group charts by (alg, alignment, threads, op) x metric.
+    # Group charts by (alg, keybits, alignment, threads, op) x metric.
     groups = defaultdict(list)
     for d in cells:
-        groups[(d["alg"], d["alignment"], d["threads"], d["op"])].append(d)
+        groups[(d["alg"], d["keybits"], d["alignment"], d["threads"], d["op"])].append(d)
 
     made = 0
-    for (alg, align, thr, op), ds in groups.items():
+    for (alg, kb, align, thr, op), ds in groups.items():
+        kbtag = f"_k{kb}" if kb not in ("", "0") else ""
         for metric in METRICS:
             ylabel, logy = METRIC_LABEL[metric]
             # series keyed by (variant, kernel)
@@ -157,11 +174,11 @@ def plot(agg, outdir):
                 ax.set_yscale("log")
             ax.set_xlabel("Message size (bytes)")
             ax.set_ylabel(ylabel)
-            ax.set_title(f"{alg}  {align}  threads={thr}  op={op}")
+            ax.set_title(f"{alg}{' ' + kb + '-bit' if kbtag else ''}  {align}  threads={thr}  op={op}")
             ax.grid(True, which="both", ls=":", alpha=0.5)
             ax.legend(fontsize=8)
             safe_alg = alg.replace("(", "_").replace(")", "")
-            fname = f"{safe_alg}_{align}_t{thr}_{op}_{metric}.png"
+            fname = f"{safe_alg}{kbtag}_{align}_t{thr}_{op}_{metric}.png"
             fig.tight_layout()
             fig.savefig(os.path.join(outdir, fname), dpi=120)
             plt.close(fig)

@@ -62,6 +62,7 @@ struct alg_ctx {
     size_t digestlen;  /* hash output size (0 for ciphers)                     */
 
     long   page_size;      /* cached sysconf(_SC_PAGESIZE)                     */
+    int    rcvbuf;         /* effective SO_RCVBUF of opfd (bounds AEAD size)   */
     size_t splice_max;     /* max bytes per zero-copy op (16 pages, ~64 KiB)  */
 };
 
@@ -99,10 +100,11 @@ ssize_t op_sendmsg(struct alg_ctx *c, alg_dir_t dir,
                    const void *in, void *out, size_t len);
 
 /*
- * Run one operation over the zero-copy path (vmsplice + splice). Payloads
- * larger than c->splice_max are processed in page-sized chunks as independent
- * operations — correct for throughput timing, NOT a single valid ciphertext
- * under CBC chaining (see plan, "Ограничения").
+ * Run one operation over the zero-copy path (vmsplice + splice). The payload
+ * is streamed as ONE operation: a single control message with MSG_MORE, then
+ * chunks of at most 16 pages (fewer when `in` is not page-aligned) spliced
+ * with SPLICE_F_MORE. The kernel chains the IV across chunks, so the output is
+ * a single valid ciphertext (or one digest of all `len` bytes) at any size.
  *
  * `in` is non-const because SPLICE_F_GIFT donates the pages to the kernel; the
  * caller must not touch the buffer until the op returns. Not supported for AEAD.
@@ -110,6 +112,15 @@ ssize_t op_sendmsg(struct alg_ctx *c, alg_dir_t dir,
  */
 ssize_t op_splice(struct alg_ctx *c, alg_dir_t dir,
                   void *in, void *out, size_t len);
+
+/*
+ * Same as op_splice, but the payload is spliced from `file_fd`'s page cache
+ * starting at *file_off (advanced by `len`) — the path the zero-copy removal
+ * targets. Reset *file_off before each op to re-process the same bytes.
+ */
+ssize_t op_splice_file(struct alg_ctx *c, alg_dir_t dir,
+                       int file_fd, off64_t *file_off,
+                       void *out, size_t len);
 
 /* Close all fds. Safe to call on a zeroed/partially-initialised ctx. */
 void alg_teardown(struct alg_ctx *c);
